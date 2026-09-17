@@ -47,6 +47,15 @@ SCALE = 4
 EDSR_NUM_FEATURES = 64
 EDSR_NUM_RES_BLOCKS = 12  # must match the --num_res_blocks used in training/train.py
 
+# Safety cap on the LARGEST side of any uploaded input image (before the scale
+# factor is applied). The models were trained on single-chromosome crops up
+# to 256x256. Full karyotype spreads (many chromosomes, ~900x1000px) are far
+# outside that training distribution AND can exhaust memory when run through
+# EDSR (12 residual blocks x 64 channels x a 4x upsample), especially on
+# small cloud instances. Rather than crash, we downscale anything larger than
+# this cap and warn the user, so the app always returns *something* safely.
+MAX_INPUT_DIM = 256
+
 
 @st.cache_resource
 def load_models():
@@ -135,18 +144,45 @@ def main():
         return
 
     lr_u8 = read_uploaded_image(uploaded_file)
+
+    # Safety guard: downscale oversized inputs (e.g. a full multi-chromosome
+    # karyotype spread) instead of letting the model run out of memory.
+    h, w = lr_u8.shape
+    longest_side = max(h, w)
+    if longest_side > MAX_INPUT_DIM:
+        resize_ratio = MAX_INPUT_DIM / longest_side
+        new_w, new_h = max(1, int(w * resize_ratio)), max(1, int(h * resize_ratio))
+        lr_u8 = cv2.resize(lr_u8, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        st.info(
+            f"ℹ️ Input was {w}x{h}, larger than this demo's {MAX_INPUT_DIM}px "
+            f"safety limit, so it was automatically downscaled to {new_w}x{new_h} "
+            "before enhancement. This model was trained on single isolated "
+            "chromosome crops, not full multi-chromosome spreads — for a "
+            "meaningful result, crop out one chromosome first rather than "
+            "relying on this automatic resize."
+        )
+
     lr01 = lr_u8.astype(np.float32) / 255.0
 
     if st.button("🔬 SUPER RESOLVE", type="primary"):
         start = time.time()
 
-        if method.startswith("EDSR") and edsr_model is not None:
-            sr01 = run_edsr(edsr_model, lr01)
-        elif method.startswith("SRCNN") and srcnn_model is not None:
-            up = run_bicubic(lr01, SCALE)
-            sr01 = run_srcnn(srcnn_model, up)
-        else:
-            sr01 = run_bicubic(lr01, SCALE)
+        try:
+            if method.startswith("EDSR") and edsr_model is not None:
+                sr01 = run_edsr(edsr_model, lr01)
+            elif method.startswith("SRCNN") and srcnn_model is not None:
+                up = run_bicubic(lr01, SCALE)
+                sr01 = run_srcnn(srcnn_model, up)
+            else:
+                sr01 = run_bicubic(lr01, SCALE)
+        except RuntimeError as e:
+            st.error(
+                "⚠️ Ran out of memory or hit a runtime error processing this "
+                "image. Try a smaller image, or a single cropped chromosome "
+                "rather than a full spread.\n\n"
+                f"Technical detail: {e}"
+            )
+            return
 
         elapsed = time.time() - start
 
