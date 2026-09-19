@@ -25,6 +25,7 @@ import io
 import os
 import sys
 import time
+import zipfile
 
 import cv2
 import numpy as np
@@ -37,6 +38,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from models.srcnn import SRCNN
 from models.edsr import EDSR
 from evaluation.metrics import compute_psnr, compute_ssim
+from preprocessing.segment_chromosomes import segment_chromosomes
 
 st.set_page_config(page_title="Chromosome Super-Resolution", layout="wide")
 
@@ -101,16 +103,21 @@ def to_png_bytes(img01: np.ndarray) -> bytes:
     return buf.tobytes()
 
 
-def main():
-    st.title("🧬 Chromosome Image Super-Resolution")
-    st.caption(
-        "Deep-learning-based reconstruction of high-resolution chromosome imagery "
-        "from medium-resolution microscopy input — with quantitative fidelity checks, "
-        "not just visual sharpening."
-    )
+def enhance_u8(lr_u8: np.ndarray, method: str, edsr_model, srcnn_model) -> np.ndarray:
+    """Run the selected method on a single grayscale uint8 image, returning a
+    float32 [0,1] output. Shared by both the single-image and the batch
+    full-spread-segmentation modes so the two stay behaviourally identical."""
+    lr01 = lr_u8.astype(np.float32) / 255.0
+    if method.startswith("EDSR") and edsr_model is not None:
+        return run_edsr(edsr_model, lr01)
+    elif method.startswith("SRCNN") and srcnn_model is not None:
+        up = run_bicubic(lr01, SCALE)
+        return run_srcnn(srcnn_model, up)
+    else:
+        return run_bicubic(lr01, SCALE)
 
-    edsr_model, srcnn_model = load_models()
 
+def render_single_mode(edsr_model, srcnn_model):
     with st.sidebar:
         st.header("Settings")
         method = st.selectbox(
@@ -120,6 +127,7 @@ def main():
                 ("SRCNN", srcnn_model is not None),
                 ("Bicubic (baseline)", True),
             ] if avail],
+            key="single_method",
         )
         st.markdown("---")
         st.subheader("Optional: ground truth")
@@ -137,6 +145,7 @@ def main():
     uploaded_file = st.file_uploader(
         "Upload a medium/low-resolution chromosome image",
         type=["png", "jpg", "jpeg", "tif", "tiff", "bmp"],
+        key="single_upload",
     )
 
     if uploaded_file is None:
@@ -158,23 +167,14 @@ def main():
             f"safety limit, so it was automatically downscaled to {new_w}x{new_h} "
             "before enhancement. This model was trained on single isolated "
             "chromosome crops, not full multi-chromosome spreads — for a "
-            "meaningful result, crop out one chromosome first rather than "
-            "relying on this automatic resize."
+            "meaningful result, use the 'Full Spread' tab instead to auto-detect "
+            "and separate each chromosome first."
         )
-
-    lr01 = lr_u8.astype(np.float32) / 255.0
 
     if st.button("🔬 SUPER RESOLVE", type="primary"):
         start = time.time()
-
         try:
-            if method.startswith("EDSR") and edsr_model is not None:
-                sr01 = run_edsr(edsr_model, lr01)
-            elif method.startswith("SRCNN") and srcnn_model is not None:
-                up = run_bicubic(lr01, SCALE)
-                sr01 = run_srcnn(srcnn_model, up)
-            else:
-                sr01 = run_bicubic(lr01, SCALE)
+            sr01 = enhance_u8(lr_u8, method, edsr_model, srcnn_model)
         except RuntimeError as e:
             st.error(
                 "⚠️ Ran out of memory or hit a runtime error processing this "
@@ -183,7 +183,6 @@ def main():
                 f"Technical detail: {e}"
             )
             return
-
         elapsed = time.time() - start
 
         col1, col2 = st.columns(2)
@@ -222,13 +221,139 @@ def main():
             m3.metric("SSIM", "—")
             st.caption("Upload a ground-truth HR image in the sidebar to compute PSNR/SSIM.")
 
-        st.markdown("---")
-        st.warning(
-            "⚠️ **Research note:** super-resolution models can enhance detail but may also "
-            "hallucinate plausible-looking structures that aren't in the original sample. "
-            "This tool is a research demonstration, not a diagnostic instrument — outputs "
-            "should not be used for clinical interpretation of chromosome structure."
-        )
+
+def render_full_spread_mode(edsr_model, srcnn_model):
+    st.markdown(
+        "Upload a **full karyotype spread** (many chromosomes in one microscopy "
+        "image). This automatically detects and separates each individual "
+        "chromosome using classical image processing (thresholding + watershed "
+        "segmentation), then runs super-resolution on each crop independently."
+    )
+    st.info(
+        "ℹ️ **Known limitation:** chromosomes that heavily overlap or cross each "
+        "other in a dense cluster may be detected as a single merged region rather "
+        "than perfectly separated. This is a well-known hard problem in "
+        "cytogenetics — even trained lab technicians separate dense overlaps "
+        "manually. Isolated and lightly-touching chromosomes separate reliably."
+    )
+
+    method = st.selectbox(
+        "Super-resolution method",
+        options=[m for m, avail in [
+            ("EDSR (recommended)", edsr_model is not None),
+            ("SRCNN", srcnn_model is not None),
+            ("Bicubic (baseline)", True),
+        ] if avail],
+        key="spread_method",
+    )
+
+    spread_file = st.file_uploader(
+        "Upload a full karyotype spread image",
+        type=["png", "jpg", "jpeg", "tif", "tiff", "bmp"],
+        key="spread_upload",
+    )
+
+    if spread_file is None:
+        st.info("Upload a full spread image to begin.")
+        return
+
+    spread_u8 = read_uploaded_image(spread_file)
+
+    if st.button("🧬 DETECT & SEPARATE CHROMOSOMES", type="primary"):
+        with st.spinner("Segmenting chromosomes..."):
+            try:
+                crops, boxes, overview_bgr = segment_chromosomes(spread_u8)
+            except Exception as e:
+                st.error(f"⚠️ Segmentation failed: {e}")
+                return
+
+        if len(crops) == 0:
+            st.warning("No chromosomes detected. Try a different image.")
+            return
+
+        st.success(f"Detected {len(crops)} chromosomes.")
+        overview_rgb = cv2.cvtColor(overview_bgr, cv2.COLOR_BGR2RGB)
+        st.image(overview_rgb, caption="Detected chromosomes (numbered)", use_container_width=True)
+
+        # Cache results in session_state so the "Enhance All" button below
+        # doesn't require re-running segmentation on every rerun.
+        st.session_state["seg_crops"] = crops
+        st.session_state["seg_method"] = method
+
+    if "seg_crops" in st.session_state:
+        crops = st.session_state["seg_crops"]
+        method = st.session_state.get("seg_method", method)
+
+        if st.button(f"✨ Enhance all {len(crops)} detected chromosomes with {method}"):
+            enhanced_list = []
+            progress = st.progress(0.0, text="Enhancing chromosomes...")
+            for i, crop in enumerate(crops):
+                try:
+                    sr01 = enhance_u8(crop, method, edsr_model, srcnn_model)
+                    enhanced_list.append(sr01)
+                except RuntimeError:
+                    enhanced_list.append(None)  # skip a crop that fails, don't kill the whole batch
+                progress.progress((i + 1) / len(crops), text=f"Enhancing chromosomes... {i+1}/{len(crops)}")
+            progress.empty()
+
+            st.session_state["seg_enhanced"] = enhanced_list
+
+        if "seg_enhanced" in st.session_state:
+            enhanced_list = st.session_state["seg_enhanced"]
+            ok_count = sum(1 for e in enhanced_list if e is not None)
+            st.success(f"Enhanced {ok_count} / {len(crops)} chromosomes.")
+
+            # Grid display, a handful of columns at a time
+            cols_per_row = 6
+            for row_start in range(0, len(crops), cols_per_row):
+                row_items = list(enumerate(crops))[row_start:row_start + cols_per_row]
+                cols = st.columns(len(row_items))
+                for col, (i, crop) in zip(cols, row_items):
+                    sr01 = enhanced_list[i]
+                    with col:
+                        if sr01 is not None:
+                            st.image((sr01 * 255).astype(np.uint8), clamp=True, use_container_width=True)
+                            st.caption(f"#{i+1}")
+                        else:
+                            st.caption(f"#{i+1} (failed)")
+
+            # Zip download of all enhanced crops
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for i, sr01 in enumerate(enhanced_list, start=1):
+                    if sr01 is not None:
+                        zf.writestr(f"chromosome_{i:03d}_enhanced.png", to_png_bytes(sr01))
+            st.download_button(
+                "Download all enhanced chromosomes (ZIP)",
+                data=zip_buf.getvalue(),
+                file_name="enhanced_chromosomes.zip",
+                mime="application/zip",
+            )
+
+
+def main():
+    st.title("🧬 Chromosome Image Super-Resolution")
+    st.caption(
+        "Deep-learning-based reconstruction of high-resolution chromosome imagery "
+        "from medium-resolution microscopy input — with quantitative fidelity checks, "
+        "not just visual sharpening."
+    )
+
+    edsr_model, srcnn_model = load_models()
+
+    tab1, tab2 = st.tabs(["Single Chromosome", "Full Spread → Auto-Separate + Enhance"])
+    with tab1:
+        render_single_mode(edsr_model, srcnn_model)
+    with tab2:
+        render_full_spread_mode(edsr_model, srcnn_model)
+
+    st.markdown("---")
+    st.warning(
+        "⚠️ **Research note:** super-resolution models can enhance detail but may also "
+        "hallucinate plausible-looking structures that aren't in the original sample. "
+        "This tool is a research demonstration, not a diagnostic instrument — outputs "
+        "should not be used for clinical interpretation of chromosome structure."
+    )
 
 
 if __name__ == "__main__":
